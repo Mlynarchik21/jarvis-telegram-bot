@@ -13,7 +13,8 @@ export async function addToHistory(userId, role, text) {
 export async function getHistory(userId) {
   const key = `hist:${userId}`;
   const raw = await kv.lrange(key, 0, MAX - 1);
-  // lrange вернёт от newest→oldest, переворачиваем
+
+  // newest->oldest, разворачиваем
   return raw
     .map((s) => {
       try { return JSON.parse(s); } catch { return null; }
