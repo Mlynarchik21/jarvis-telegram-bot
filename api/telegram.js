@@ -1,11 +1,10 @@
 import { parseUserText } from "../lib/parse.js";
 import { sendMessage, answerCallbackQuery } from "../lib/tg.js";
 import { setPending, getPending, clearPending, addNote, listNotes } from "../lib/store.js";
-import { geminiAnswer } from "../lib/gemini.js";
 import { addToHistory, getHistory } from "../lib/memory.js";
 import { kv } from "@vercel/kv";
 import { parseReminder } from "../lib/remind_parse.js";
-import { togetherAnswer } from "../lib/together.js";
+import { openaiAnswer } from "../lib/openai.js";
 
 function requireEnv(name) {
   const v = process.env[name];
@@ -49,9 +48,9 @@ function detectMode(userText) {
     t.startsWith("дай ссылку") ||
     t.startsWith("пришли ссылку") ||
     t.startsWith("скинь ссылку") ||
-    t.startsWith("скинь ссылку") ||
     t.includes("только ссылку") ||
-    t.includes("ссылка на")
+    t.includes("ссылка на") ||
+    t.includes("сайт ")
   ) return "LINK_ONLY";
 
   if (
@@ -80,10 +79,10 @@ async function sendChatAction(token, chatId) {
 
 export default async function handler(req, res) {
   try {
-    if (req.method !== "POST") {
-      res.status(200).send("OK");
-      return;
-    }
+    // Проверим, что ключ OpenAI задан (чтобы сразу увидеть ошибку в логах)
+    requireEnv("OPENAI_API_KEY");
+
+    if (req.method !== "POST") return res.status(200).send("OK");
 
     const BOT_TOKEN = requireEnv("BOT_TOKEN");
     const update = await readUpdate(req);
@@ -142,7 +141,7 @@ export default async function handler(req, res) {
 
     if (!chatId || !userId) return res.status(200).json({ ok: true });
 
-    // Если пользователь редактирует заметку
+    // режим редактирования заметки
     const prevPending = await getPending(userId);
     if (prevPending?.mode === "editing") {
       const newPending = { intent: prevPending.intent, fields: { text }, mode: "draft" };
@@ -157,9 +156,10 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true });
     }
 
-    // ⚠️ ЖЁСТКИЙ ПЕРЕХВАТ “НАПОМНИ …” ДО ЛЮБЫХ ИИ
+    // ✅ ЖЁСТКИЙ ПЕРЕХВАТ НАПОМИНАНИЙ (не отдаём в ИИ)
     if (text.trim().toLowerCase().startsWith("напомни")) {
       const r = parseReminder(text);
+
       if (!r) {
         await sendMessage(
           BOT_TOKEN,
@@ -178,7 +178,6 @@ export default async function handler(req, res) {
 
       const when = new Date(r.fireAt).toLocaleString("ru-RU");
       await sendMessage(BOT_TOKEN, chatId, `Ок 👍 Напомню: <b>${escapeHtml(r.body)}</b>\nКогда: ${escapeHtml(when)}`);
-
       return res.status(200).json({ ok: true });
     }
 
@@ -219,7 +218,7 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true });
     }
 
-    // ===== ЧАТ (Gemini → fallback Together) =====
+    // ===== ЧАТ =====
     if (parsed.intent === "chat") {
       await sendChatAction(BOT_TOKEN, chatId);
 
@@ -227,8 +226,6 @@ export default async function handler(req, res) {
 
       await addToHistory(userId, "user", parsed.fields.text);
       const history = await getHistory(userId);
-
-      // контекст короткий (ускоряет и уменьшает “простыни”)
       const context = history
         .slice(-8)
         .map((m) => (m.role === "user" ? `Пользователь: ${m.text}` : `Ассистент: ${m.text}`))
@@ -237,73 +234,40 @@ export default async function handler(req, res) {
       const persona =
         "Ты — личный ассистент по жизни по имени Джарвис. " +
         "НЕ говори, что ты бот/ИИ/модель, если тебя не спросили. " +
-        "Отвечай максимально точно под запрос. ";
+        "Отвечай максимально точно под запрос пользователя.";
 
-      let style = "";
-      let maxTokens = 320;
+      let rules = "";
+      let maxTokens = 300;
 
       if (mode === "LINK_ONLY") {
-        style =
-          "Пользователь просит ссылку. Ответь ТОЛЬКО одной ссылкой (URL) и ничего больше.";
+        rules = "Пользователь просит ссылку. Ответь ТОЛЬКО одним URL. Без пояснений.";
         maxTokens = 80;
       } else if (mode === "DETAILED") {
-        style =
-          "Ответь развёрнуто: короткое резюме, затем объяснение, затем шаги. ";
+        rules = "Ответь развёрнуто: короткое резюме, затем объяснение, затем шаги.";
         maxTokens = 700;
       } else {
-        style =
-          "Отвечай кратко и по делу (1–6 предложений). " +
-          "Если пользователь захочет — предложи сказать «подробнее». ";
-        maxTokens = 300;
+        rules = "Отвечай кратко и по делу (1–6 предложений). Если нужно — предложи «подробнее».";
+        maxTokens = 320;
       }
 
       const prompt =
-        persona +
-        style +
-        "\n\nКонтекст:\n" +
-        context +
-        "\n\nЗапрос пользователя:\n" +
-        parsed.fields.text;
+        `${persona}\n${rules}\n\n` +
+        `Контекст:\n${context}\n\n` +
+        `Запрос:\n${parsed.fields.text}`;
 
-      let answerText = "";
-      let sources = [];
+      const { text: answer } = await openaiAnswer({ userText: prompt, maxOutputTokens: maxTokens });
 
-      // 1) пробуем Gemini
-      try {
-        const apiKey = requireEnv("GEMINI_API_KEY");
-        const out = await geminiAnswer({ apiKey, userText: prompt, maxOutputTokens: maxTokens });
-        answerText = out.text;
-        sources = out.sources ?? [];
-      } catch {
-        // 2) fallback Together
-        const apiKey = requireEnv("TOGETHER_API_KEY");
-        const messages = [
-          { role: "system", content: persona + style },
-          { role: "user", content: "Контекст:\n" + context + "\n\nЗапрос:\n" + parsed.fields.text }
-        ];
-        const out = await togetherAnswer({ apiKey, messages, maxTokens });
-        answerText = out.text;
-      }
-
-      // ЖЁСТКОЕ ПРАВИЛО: режим “ссылка” → отправляем только URL
+      // Режим “только ссылка”: вырежем URL строго
       if (mode === "LINK_ONLY") {
-        const url = extractFirstUrl(answerText);
-        await addToHistory(userId, "assistant", url ?? answerText);
-        await sendMessage(BOT_TOKEN, chatId, url ? escapeHtml(url) : "Не нашёл точную ссылку — уточни название.");
+        const url = extractFirstUrl(answer);
+        const out = url ?? "Не нашёл точную ссылку — уточни название.";
+        await addToHistory(userId, "assistant", out);
+        await sendMessage(BOT_TOKEN, chatId, escapeHtml(out));
         return res.status(200).json({ ok: true });
       }
 
-      await addToHistory(userId, "assistant", answerText);
-
-      // Источники показываем ТОЛЬКО в подробном режиме, чтобы не засорять
-      let finalText = answerText;
-      if (mode === "DETAILED" && sources.length) {
-        finalText +=
-          "\n\n<b>Источники:</b>\n" +
-          sources.slice(0, 3).map((s, i) => `${i + 1}) ${escapeHtml(s.title)}\n${escapeHtml(s.uri)}`).join("\n");
-      }
-
-      await sendMessage(BOT_TOKEN, chatId, finalText);
+      await addToHistory(userId, "assistant", answer);
+      await sendMessage(BOT_TOKEN, chatId, answer);
       return res.status(200).json({ ok: true });
     }
 
