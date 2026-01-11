@@ -13,7 +13,10 @@ function requireEnv(name) {
 }
 
 function escapeHtml(s) {
-  return String(s).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+  return String(s)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
 }
 
 function buildConfirmKeyboard() {
@@ -22,9 +25,9 @@ function buildConfirmKeyboard() {
       [
         { text: "✅ Сохранить", callback_data: "confirm:save" },
         { text: "✏️ Изменить", callback_data: "confirm:edit" },
-        { text: "❌ Отмена", callback_data: "confirm:cancel" }
-      ]
-    ]
+        { text: "❌ Отмена", callback_data: "confirm:cancel" },
+      ],
+    ],
   };
 }
 
@@ -38,19 +41,22 @@ async function readUpdate(req) {
   });
 
   if (!raw) return null;
-  try { return JSON.parse(raw); } catch { return null; }
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
 }
 
-function detectMode(userText) {
-  const t = userText.toLowerCase();
+function detectMode(text) {
+  const t = text.toLowerCase();
 
   if (
     t.startsWith("дай ссылку") ||
     t.startsWith("пришли ссылку") ||
     t.startsWith("скинь ссылку") ||
     t.includes("только ссылку") ||
-    t.includes("ссылка на") ||
-    t.includes("сайт ")
+    t.includes("ссылка на")
   ) return "LINK_ONLY";
 
   if (
@@ -68,27 +74,17 @@ function extractFirstUrl(text) {
   return m ? m[0] : null;
 }
 
-async function sendChatAction(token, chatId) {
-  const url = `https://api.telegram.org/bot${token}/sendChatAction`;
-  await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, action: "typing" })
-  }).catch(() => {});
-}
-
 export default async function handler(req, res) {
   try {
-    // Проверим, что ключ OpenAI задан (чтобы сразу увидеть ошибку в логах)
     requireEnv("OPENAI_API_KEY");
+    const BOT_TOKEN = requireEnv("BOT_TOKEN");
 
     if (req.method !== "POST") return res.status(200).send("OK");
 
-    const BOT_TOKEN = requireEnv("BOT_TOKEN");
     const update = await readUpdate(req);
     if (!update) return res.status(200).json({ ok: true });
 
-    // ===== Кнопки =====
+    // ===== CALLBACKS =====
     if (update.callback_query) {
       const cq = update.callback_query;
       const userId = cq.from?.id;
@@ -102,22 +98,22 @@ export default async function handler(req, res) {
       const pending = await getPending(userId);
 
       if (data === "confirm:save") {
-        if (!pending) {
-          await sendMessage(BOT_TOKEN, chatId, "Нечего подтверждать 🙂");
-        } else if (pending.intent === "create_note") {
+        if (pending?.intent === "create_note") {
           const created = await addNote(userId, pending.fields.text);
           await clearPending(userId);
-          await sendMessage(BOT_TOKEN, chatId, `Готово ✅\n\n<b>Заметка:</b>\n${escapeHtml(created.text)}`);
+          await sendMessage(
+            BOT_TOKEN,
+            chatId,
+            `Готово ✅\n\n<b>Заметка:</b>\n${escapeHtml(created.text)}`
+          );
         }
         return res.status(200).json({ ok: true });
       }
 
       if (data === "confirm:edit") {
-        if (!pending) {
-          await sendMessage(BOT_TOKEN, chatId, "Нечего редактировать 🙂");
-        } else {
+        if (pending) {
           await setPending(userId, { ...pending, mode: "editing" });
-          await sendMessage(BOT_TOKEN, chatId, "Ок. Пришли новый текст одним сообщением ✍️");
+          await sendMessage(BOT_TOKEN, chatId, "Ок. Пришли новый текст ✍️");
         }
         return res.status(200).json({ ok: true });
       }
@@ -131,7 +127,7 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true });
     }
 
-    // ===== Сообщения =====
+    // ===== MESSAGES =====
     const msg = update.message;
     if (!msg?.text) return res.status(200).json({ ok: true });
 
@@ -141,33 +137,28 @@ export default async function handler(req, res) {
 
     if (!chatId || !userId) return res.status(200).json({ ok: true });
 
-    // режим редактирования заметки
+    // edit mode
     const prevPending = await getPending(userId);
     if (prevPending?.mode === "editing") {
-      const newPending = { intent: prevPending.intent, fields: { text }, mode: "draft" };
-      await setPending(userId, newPending);
-
+      await setPending(userId, { intent: prevPending.intent, fields: { text }, mode: "draft" });
       await sendMessage(
         BOT_TOKEN,
         chatId,
-        `Обновил черновик ✏️\n\n<b>Заметка:</b>\n${escapeHtml(text)}\n\nСохранить?`,
+        `Обновил ✏️\n\n<b>Заметка:</b>\n${escapeHtml(text)}\n\nСохранить?`,
         buildConfirmKeyboard()
       );
       return res.status(200).json({ ok: true });
     }
 
-    // ✅ ЖЁСТКИЙ ПЕРЕХВАТ НАПОМИНАНИЙ (не отдаём в ИИ)
-    if (text.trim().toLowerCase().startsWith("напомни")) {
+    // 🔥 НАПОМИНАНИЯ — НЕ УХОДЯТ В ИИ
+    if (text.toLowerCase().startsWith("напомни")) {
       const r = parseReminder(text);
 
       if (!r) {
         await sendMessage(
           BOT_TOKEN,
           chatId,
-          "Напиши так:\n" +
-            "• напомни через 10 минут купить воду\n" +
-            "• напомни через 2 часа позвонить\n" +
-            "• напомни завтра в 09:00 оплатить интернет"
+          "Пример:\n• напомни через 10 минут купить воду\n• напомни завтра в 09:00 оплатить интернет"
         );
         return res.status(200).json({ ok: true });
       }
@@ -177,7 +168,11 @@ export default async function handler(req, res) {
       await kv.zadd("reminders:due", { score: r.fireAt, member: id });
 
       const when = new Date(r.fireAt).toLocaleString("ru-RU");
-      await sendMessage(BOT_TOKEN, chatId, `Ок 👍 Напомню: <b>${escapeHtml(r.body)}</b>\nКогда: ${escapeHtml(when)}`);
+      await sendMessage(
+        BOT_TOKEN,
+        chatId,
+        `Ок 👍 Напомню: <b>${escapeHtml(r.body)}</b>\nКогда: ${escapeHtml(when)}`
+      );
       return res.status(200).json({ ok: true });
     }
 
@@ -191,7 +186,7 @@ export default async function handler(req, res) {
           "• обычный текст — отвечаю\n" +
           "• <b>заметка: ...</b> — сохранить\n" +
           "• <b>заметки</b> — показать\n" +
-          "• <b>напомни через 10 минут ...</b>\n\n" +
+          "• <b>напомни ...</b> — поставить напоминание\n\n" +
           "Подсказка: «дай ссылку на ...» — отвечу только URL."
       );
       return res.status(200).json({ ok: true });
@@ -202,7 +197,7 @@ export default async function handler(req, res) {
       if (!notes.length) await sendMessage(BOT_TOKEN, chatId, "Пока нет заметок.");
       else {
         const lines = notes.map((n, i) => `${i + 1}) ${escapeHtml(n.text)}`);
-        await sendMessage(BOT_TOKEN, chatId, `<b>Последние заметки:</b>\n` + lines.join("\n"));
+        await sendMessage(BOT_TOKEN, chatId, `<b>Заметки:</b>\n` + lines.join("\n"));
       }
       return res.status(200).json({ ok: true });
     }
@@ -218,35 +213,34 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true });
     }
 
-    // ===== ЧАТ =====
+    // ===== GPT CHAT =====
     if (parsed.intent === "chat") {
-      await sendChatAction(BOT_TOKEN, chatId);
-
       const mode = detectMode(parsed.fields.text);
 
       await addToHistory(userId, "user", parsed.fields.text);
       const history = await getHistory(userId);
+
       const context = history
         .slice(-8)
         .map((m) => (m.role === "user" ? `Пользователь: ${m.text}` : `Ассистент: ${m.text}`))
         .join("\n");
 
       const persona =
-        "Ты — личный ассистент по жизни по имени Джарвис. " +
-        "НЕ говори, что ты бот/ИИ/модель, если тебя не спросили. " +
-        "Отвечай максимально точно под запрос пользователя.";
+        "Ты — личный ассистент по имени Джарвис. " +
+        "НЕ говори, что ты бот или ИИ, если тебя не спросили. " +
+        "Отвечай точно по запросу.";
 
       let rules = "";
       let maxTokens = 300;
 
       if (mode === "LINK_ONLY") {
-        rules = "Пользователь просит ссылку. Ответь ТОЛЬКО одним URL. Без пояснений.";
+        rules = "Ответь ТОЛЬКО одной ссылкой (URL). Без пояснений.";
         maxTokens = 80;
       } else if (mode === "DETAILED") {
-        rules = "Ответь развёрнуто: короткое резюме, затем объяснение, затем шаги.";
+        rules = "Ответь развёрнуто: сначала кратко, потом объяснение.";
         maxTokens = 700;
       } else {
-        rules = "Отвечай кратко и по делу (1–6 предложений). Если нужно — предложи «подробнее».";
+        rules = "Отвечай кратко и по делу (1–6 предложений).";
         maxTokens = 320;
       }
 
@@ -255,9 +249,11 @@ export default async function handler(req, res) {
         `Контекст:\n${context}\n\n` +
         `Запрос:\n${parsed.fields.text}`;
 
-      const { text: answer } = await openaiAnswer({ userText: prompt, maxOutputTokens: maxTokens });
+      const { text: answer } = await openaiAnswer({
+        prompt,
+        maxTokens,
+      });
 
-      // Режим “только ссылка”: вырежем URL строго
       if (mode === "LINK_ONLY") {
         const url = extractFirstUrl(answer);
         const out = url ?? "Не нашёл точную ссылку — уточни название.";
