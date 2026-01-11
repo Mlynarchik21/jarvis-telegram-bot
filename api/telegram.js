@@ -41,8 +41,39 @@ async function readUpdate(req) {
   });
 
   if (!raw) return null;
-
   try { return JSON.parse(raw); } catch { return null; }
+}
+
+function detectMode(userText) {
+  const t = userText.toLowerCase();
+
+  // “дай ссылку” → только ссылка
+  if (
+    t.startsWith("дай ссылку") ||
+    t.startsWith("пришли ссылку") ||
+    t.startsWith("скинь ссылку") ||
+    t.includes("только ссылку") ||
+    t.includes("ссылка на")
+  ) return "LINK_ONLY";
+
+  // “расскажи/объясни/подробно” → развёрнуто
+  if (
+    t.startsWith("расскажи") ||
+    t.startsWith("объясни") ||
+    t.includes("подробно") ||
+    t.includes("детально")
+  ) return "DETAILED";
+
+  return "NORMAL";
+}
+
+async function sendChatAction(token, chatId) {
+  const url = `https://api.telegram.org/bot${token}/sendChatAction`;
+  await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, action: "typing" })
+  }).catch(() => {});
 }
 
 export default async function handler(req, res) {
@@ -60,7 +91,7 @@ export default async function handler(req, res) {
       return;
     }
 
-    // ===================== CALLBACKS (кнопки) =====================
+    // ====== КНОПКИ ======
     if (update.callback_query) {
       const cq = update.callback_query;
       const userId = cq.from?.id;
@@ -88,10 +119,7 @@ export default async function handler(req, res) {
             chatId,
             `Готово ✅\n\n<b>Заметка:</b>\n${escapeHtml(created.text)}`
           );
-        } else {
-          await sendMessage(BOT_TOKEN, chatId, "Пока подтверждение сделано только для заметок.");
         }
-
         res.status(200).json({ ok: true });
         return;
       }
@@ -103,7 +131,6 @@ export default async function handler(req, res) {
           await setPending(userId, { ...pending, mode: "editing" });
           await sendMessage(BOT_TOKEN, chatId, "Ок. Пришли новый текст одним сообщением ✍️");
         }
-
         res.status(200).json({ ok: true });
         return;
       }
@@ -119,7 +146,7 @@ export default async function handler(req, res) {
       return;
     }
 
-    // ===================== MESSAGES =====================
+    // ====== СООБЩЕНИЯ ======
     const msg = update.message;
     if (!msg?.text) {
       res.status(200).json({ ok: true });
@@ -135,7 +162,7 @@ export default async function handler(req, res) {
       return;
     }
 
-    // режим редактирования черновика заметки
+    // режим редактирования заметки
     const prevPending = await getPending(userId);
     if (prevPending?.mode === "editing") {
       const newPending = {
@@ -158,23 +185,22 @@ export default async function handler(req, res) {
 
     const parsed = parseUserText(text);
 
-    // /start
     if (parsed.intent === "start") {
       await sendMessage(
         BOT_TOKEN,
         chatId,
         "Привет 🙂\n\n" +
-          "Пиши обычным текстом — отвечу развёрнуто.\n\n" +
-          "• <b>заметка: ...</b> — сохранить заметку\n" +
-          "• <b>заметки</b> — показать последние\n" +
+          "• обычный текст — отвечаю как человек\n" +
+          "• <b>заметка: ...</b> — сохранить\n" +
+          "• <b>заметки</b> — показать\n" +
           "• <b>напомни через 10 минут ...</b>\n" +
-          "• <b>напомни завтра в 09:00 ...</b>"
+          "• <b>напомни завтра в 09:00 ...</b>\n\n" +
+          "Подсказка: если хочешь только URL — напиши «дай ссылку на ...»"
       );
       res.status(200).json({ ok: true });
       return;
     }
 
-    // заметки
     if (parsed.intent === "list_notes") {
       const notes = await listNotes(userId, 5);
       if (!notes.length) {
@@ -187,34 +213,25 @@ export default async function handler(req, res) {
       return;
     }
 
-    // создать заметку (с подтверждением)
     if (parsed.intent === "create_note") {
-      await setPending(userId, {
-        intent: "create_note",
-        fields: parsed.fields,
-        mode: "draft"
-      });
-
+      await setPending(userId, { intent: "create_note", fields: parsed.fields, mode: "draft" });
       await sendMessage(
         BOT_TOKEN,
         chatId,
         `Сохранить заметку?\n\n<b>${escapeHtml(parsed.fields.text)}</b>`,
         buildConfirmKeyboard()
       );
-
       res.status(200).json({ ok: true });
       return;
     }
 
-    // создать напоминание
     if (parsed.intent === "create_reminder") {
       const r = parseReminder(parsed.fields.text);
-
       if (!r) {
         await sendMessage(
           BOT_TOKEN,
           chatId,
-          "Понял. Можешь написать так:\n" +
+          "Понял. Напиши так:\n" +
             "• напомни через 10 минут купить воду\n" +
             "• напомни через 2 часа позвонить\n" +
             "• напомни завтра в 09:00 оплатить интернет"
@@ -224,8 +241,7 @@ export default async function handler(req, res) {
       }
 
       const id = crypto.randomUUID();
-
-      await kv.set(`reminder:${id}`, { chatId, text: r.body }, { ex: 60 * 60 * 24 * 30 }); // 30 дней
+      await kv.set(`reminder:${id}`, { chatId, text: r.body }, { ex: 60 * 60 * 24 * 30 });
       await kv.zadd("reminders:due", { score: r.fireAt, member: id });
 
       const when = new Date(r.fireAt).toLocaleString("ru-RU");
@@ -235,48 +251,63 @@ export default async function handler(req, res) {
       return;
     }
 
-    // ===================== CHAT (ИИ) =====================
+    // ====== ЧАТ С ИИ ======
     if (parsed.intent === "chat") {
       const apiKey = requireEnv("GEMINI_API_KEY");
+      const mode = detectMode(parsed.fields.text);
 
-      // сохраняем сообщение пользователя в историю
+      await sendChatAction(BOT_TOKEN, chatId);
+
       await addToHistory(userId, "user", parsed.fields.text);
-
       const history = await getHistory(userId);
       const context = history
         .map((m) => (m.role === "user" ? `Пользователь: ${m.text}` : `Ассистент: ${m.text}`))
         .join("\n");
 
-      const persona =
+      const personaBase =
         "Ты — личный ассистент по жизни по имени Джарвис. " +
-        "Общайся естественно, как человек: уверенно, тепло, без лишних дисклеймеров. " +
-        "НЕ говори, что ты бот/ИИ/модель, если тебя прямо не спросили. " +
-        "Отвечай по-русски развёрнуто, с рассуждениями и шагами. " +
-        "Если вопрос про факты/новости — используй поиск и добавляй источники. " +
-        "Если не уверен — уточни, что именно нужно, но не пугай пользователя.";
+        "Говори естественно, по-человечески. " +
+        "НЕ упоминай, что ты бот/ИИ/модель, если тебя не спросили. ";
+
+      let style;
+      let maxTokens;
+
+      if (mode === "LINK_ONLY") {
+        style =
+          "Пользователь просит ссылку. Ответь ТОЛЬКО одной ссылкой (URL) без лишнего текста. " +
+          "Если точной ссылки не нашёл — напиши: «Не нашёл точную ссылку, уточни название».";
+        maxTokens = 120;
+      } else if (mode === "DETAILED") {
+        style =
+          "Ответь развёрнуто: короткое резюме, затем объяснение и шаги. ";
+        maxTokens = 700;
+      } else {
+        style =
+          "Отвечай кратко и по делу (5–10 строк). Если нужны детали — предложи спросить «подробнее». ";
+        maxTokens = 350;
+      }
 
       const { text: answer, sources } = await geminiAnswer({
         apiKey,
+        maxOutputTokens: maxTokens,
         userText:
-          persona +
-          "\n\nКонтекст последних сообщений:\n" +
+          personaBase +
+          style +
+          "\n\nКонтекст (последние сообщения):\n" +
           context +
-          "\n\nТекущий запрос пользователя:\n" +
+          "\n\nЗапрос пользователя:\n" +
           parsed.fields.text
       });
 
-      // сохраняем ответ ассистента в историю
       await addToHistory(userId, "assistant", answer);
 
       let finalText = answer ?? "Не получилось получить ответ.";
 
-      if (sources?.length) {
+      // Источники показываем только если НЕ режим “только ссылка”
+      if (mode !== "LINK_ONLY" && sources?.length) {
         finalText +=
           "\n\n<b>Источники:</b>\n" +
-          sources
-            .slice(0, 3)
-            .map((s, i) => `${i + 1}) ${escapeHtml(s.title)}\n${escapeHtml(s.uri)}`)
-            .join("\n");
+          sources.slice(0, 3).map((s, i) => `${i + 1}) ${escapeHtml(s.title)}\n${escapeHtml(s.uri)}`).join("\n");
       }
 
       await sendMessage(BOT_TOKEN, chatId, finalText);
@@ -288,7 +319,6 @@ export default async function handler(req, res) {
     res.status(200).json({ ok: true });
   } catch (e) {
     console.error(e);
-    // Telegram не любит 500
     res.status(200).json({ ok: true });
   }
 }
