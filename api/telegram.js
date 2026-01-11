@@ -1,11 +1,7 @@
-import { parseUserText } from "../lib/parse.js";
-import { sendMessage, answerCallbackQuery } from "../lib/tg.js";
-import { setPending, getPending, clearPending, addNote, listNotes } from "../lib/store.js";
-import { addToHistory, getHistory } from "../lib/memory.js";
 import { kv } from "@vercel/kv";
-import { parseReminder } from "../lib/remind_parse.js";
 import { openaiAnswer } from "../lib/openai.js";
 
+// ---------------- helpers ----------------
 function requireEnv(name) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing env var: ${name}`);
@@ -17,18 +13,6 @@ function escapeHtml(s) {
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;");
-}
-
-function buildConfirmKeyboard() {
-  return {
-    inline_keyboard: [
-      [
-        { text: "✅ Сохранить", callback_data: "confirm:save" },
-        { text: "✏️ Изменить", callback_data: "confirm:edit" },
-        { text: "❌ Отмена", callback_data: "confirm:cancel" },
-      ],
-    ],
-  };
 }
 
 async function readUpdate(req) {
@@ -48,6 +32,112 @@ async function readUpdate(req) {
   }
 }
 
+async function tgCall(token, method, payload) {
+  const url = `https://api.telegram.org/bot${token}/${method}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`Telegram ${method} failed: ${res.status} ${t}`);
+  }
+  return res.json();
+}
+
+async function sendMessage(token, chatId, text, replyMarkup) {
+  return tgCall(token, "sendMessage", {
+    chat_id: chatId,
+    text,
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+    ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+  });
+}
+
+async function answerCallbackQuery(token, id) {
+  return tgCall(token, "answerCallbackQuery", {
+    callback_query_id: id,
+    text: "Ок",
+    show_alert: false,
+  });
+}
+
+async function sendChatAction(token, chatId) {
+  // typing (не критично, если не получится)
+  try {
+    await tgCall(token, "sendChatAction", { chat_id: chatId, action: "typing" });
+  } catch {}
+}
+
+function buildConfirmKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: "✅ Сохранить", callback_data: "confirm:save" },
+        { text: "✏️ Изменить", callback_data: "confirm:edit" },
+        { text: "❌ Отмена", callback_data: "confirm:cancel" },
+      ],
+    ],
+  };
+}
+
+function extractFirstUrl(text) {
+  const m = String(text).match(/https?:\/\/[^\s)]+/i);
+  return m ? m[0] : null;
+}
+
+// ---------------- storage (KV) ----------------
+async function setPending(userId, obj) {
+  await kv.set(`pending:${userId}`, obj, { ex: 60 * 30 }); // 30 мин
+}
+async function getPending(userId) {
+  return (await kv.get(`pending:${userId}`)) ?? null;
+}
+async function clearPending(userId) {
+  await kv.del(`pending:${userId}`);
+}
+
+async function addNote(userId, text) {
+  const item = { id: crypto.randomUUID(), text, createdAt: Date.now() };
+  await kv.lpush(`notes:${userId}`, JSON.stringify(item));
+  await kv.ltrim(`notes:${userId}`, 0, 49);
+  return item;
+}
+async function listNotes(userId, limit = 5) {
+  const raw = await kv.lrange(`notes:${userId}`, 0, limit - 1);
+  return raw
+    .map((s) => {
+      try {
+        return JSON.parse(s);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+}
+
+async function addToHistory(userId, role, text) {
+  const item = { role, text, at: Date.now() };
+  await kv.lpush(`hist:${userId}`, JSON.stringify(item));
+  await kv.ltrim(`hist:${userId}`, 0, 7); // 8 сообщений
+}
+async function getHistory(userId) {
+  const raw = await kv.lrange(`hist:${userId}`, 0, 7);
+  return raw
+    .map((s) => {
+      try {
+        return JSON.parse(s);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean)
+    .reverse();
+}
+
+// ---------------- intent ----------------
 function detectMode(text) {
   const t = text.toLowerCase();
 
@@ -57,41 +147,74 @@ function detectMode(text) {
     t.startsWith("скинь ссылку") ||
     t.includes("только ссылку") ||
     t.includes("ссылка на")
-  ) return "LINK_ONLY";
+  )
+    return "LINK_ONLY";
 
   if (
     t.startsWith("расскажи") ||
     t.startsWith("объясни") ||
     t.includes("подробно") ||
     t.includes("детально")
-  ) return "DETAILED";
+  )
+    return "DETAILED";
 
   return "NORMAL";
 }
 
-function extractFirstUrl(text) {
-  const m = String(text).match(/https?:\/\/[^\s)]+/i);
-  return m ? m[0] : null;
+function parseReminder(text) {
+  const t = text.trim();
+
+  // напомни через N минут/часов ...
+  const m1 = t.match(/напомни\s+через\s+(\d+)\s*(минут|мин|час|часа|часов)\s+(.+)/i);
+  if (m1) {
+    const n = parseInt(m1[1], 10);
+    const unit = m1[2].toLowerCase();
+    const body = m1[3].trim();
+    const ms = unit.startsWith("мин") ? n * 60_000 : n * 3_600_000;
+    return { fireAt: Date.now() + ms, body };
+  }
+
+  // напомни завтра в HH:MM ...
+  const m2 = t.match(/напомни\s+завтра\s+в\s+(\d{1,2}):(\d{2})\s+(.+)/i);
+  if (m2) {
+    const hh = Number(m2[1]);
+    const mm = Number(m2[2]);
+    const body = m2[3].trim();
+    const now = new Date();
+    const tomorrow = new Date(now);
+    tomorrow.setDate(now.getDate() + 1);
+    tomorrow.setHours(hh, mm, 0, 0);
+    return { fireAt: tomorrow.getTime(), body };
+  }
+
+  return null;
 }
 
+// ---------------- handler ----------------
 export default async function handler(req, res) {
   try {
-    requireEnv("OPENAI_API_KEY");
     const BOT_TOKEN = requireEnv("BOT_TOKEN");
+    requireEnv("OPENAI_API_KEY"); // чтобы сразу ловить проблему
 
-    if (req.method !== "POST") return res.status(200).send("OK");
+    if (req.method !== "POST") {
+      res.status(200).send("OK");
+      return;
+    }
 
     const update = await readUpdate(req);
-    if (!update) return res.status(200).json({ ok: true });
+    if (!update) {
+      res.status(200).json({ ok: true });
+      return;
+    }
 
-    // ===== CALLBACKS =====
+    // ---------- callbacks ----------
     if (update.callback_query) {
       const cq = update.callback_query;
       const userId = cq.from?.id;
       const chatId = cq.message?.chat?.id;
       const data = cq.data ?? "";
 
-      await answerCallbackQuery(BOT_TOKEN, cq.id, "Ок");
+      await answerCallbackQuery(BOT_TOKEN, cq.id);
 
       if (!userId || !chatId) return res.status(200).json({ ok: true });
 
@@ -106,6 +229,8 @@ export default async function handler(req, res) {
             chatId,
             `Готово ✅\n\n<b>Заметка:</b>\n${escapeHtml(created.text)}`
           );
+        } else {
+          await sendMessage(BOT_TOKEN, chatId, "Нечего сохранять 🙂");
         }
         return res.status(200).json({ ok: true });
       }
@@ -113,7 +238,9 @@ export default async function handler(req, res) {
       if (data === "confirm:edit") {
         if (pending) {
           await setPending(userId, { ...pending, mode: "editing" });
-          await sendMessage(BOT_TOKEN, chatId, "Ок. Пришли новый текст ✍️");
+          await sendMessage(BOT_TOKEN, chatId, "Ок. Пришли новый текст одним сообщением ✍️");
+        } else {
+          await sendMessage(BOT_TOKEN, chatId, "Нечего редактировать 🙂");
         }
         return res.status(200).json({ ok: true });
       }
@@ -127,17 +254,17 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true });
     }
 
-    // ===== MESSAGES =====
+    // ---------- message ----------
     const msg = update.message;
     if (!msg?.text) return res.status(200).json({ ok: true });
 
     const chatId = msg.chat?.id;
     const userId = msg.from?.id;
-    const text = msg.text;
+    const text = msg.text.trim();
 
     if (!chatId || !userId) return res.status(200).json({ ok: true });
 
-    // edit mode
+    // editing note flow
     const prevPending = await getPending(userId);
     if (prevPending?.mode === "editing") {
       await setPending(userId, { intent: prevPending.intent, fields: { text }, mode: "draft" });
@@ -150,10 +277,54 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true });
     }
 
-    // 🔥 НАПОМИНАНИЯ — НЕ УХОДЯТ В ИИ
+    // /start
+    if (text.toLowerCase() === "/start") {
+      await sendMessage(
+        BOT_TOKEN,
+        chatId,
+        "Привет 🙂\n\n" +
+          "• обычный текст — отвечаю\n" +
+          "• <b>заметка: ...</b> — сохранить\n" +
+          "• <b>заметки</b> — показать\n" +
+          "• <b>напомни через 10 минут ...</b>\n\n" +
+          "Подсказка: «дай ссылку на ...» — отвечу только URL."
+      );
+      return res.status(200).json({ ok: true });
+    }
+
+    // list notes
+    if (text.toLowerCase() === "заметки" || text.toLowerCase() === "/notes") {
+      const notes = await listNotes(userId, 5);
+      if (!notes.length) {
+        await sendMessage(BOT_TOKEN, chatId, "Пока нет заметок.");
+      } else {
+        const lines = notes.map((n, i) => `${i + 1}) ${escapeHtml(n.text)}`);
+        await sendMessage(BOT_TOKEN, chatId, `<b>Заметки:</b>\n` + lines.join("\n"));
+      }
+      return res.status(200).json({ ok: true });
+    }
+
+    // create note
+    if (text.toLowerCase().startsWith("заметка:") || text.toLowerCase().startsWith("note:")) {
+      const noteText = text.split(":").slice(1).join(":").trim();
+      if (!noteText) {
+        await sendMessage(BOT_TOKEN, chatId, "Напиши так: <b>заметка: купить молоко</b>");
+        return res.status(200).json({ ok: true });
+      }
+
+      await setPending(userId, { intent: "create_note", fields: { text: noteText }, mode: "draft" });
+      await sendMessage(
+        BOT_TOKEN,
+        chatId,
+        `Сохранить заметку?\n\n<b>${escapeHtml(noteText)}</b>`,
+        buildConfirmKeyboard()
+      );
+      return res.status(200).json({ ok: true });
+    }
+
+    // ✅ reminders (НЕ отдаём в GPT)
     if (text.toLowerCase().startsWith("напомни")) {
       const r = parseReminder(text);
-
       if (!r) {
         await sendMessage(
           BOT_TOKEN,
@@ -176,101 +347,55 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true });
     }
 
-    const parsed = parseUserText(text);
+    // ---------- GPT chat ----------
+    await sendChatAction(BOT_TOKEN, chatId);
 
-    if (parsed.intent === "start") {
-      await sendMessage(
-        BOT_TOKEN,
-        chatId,
-        "Привет 🙂\n\n" +
-          "• обычный текст — отвечаю\n" +
-          "• <b>заметка: ...</b> — сохранить\n" +
-          "• <b>заметки</b> — показать\n" +
-          "• <b>напомни ...</b> — поставить напоминание\n\n" +
-          "Подсказка: «дай ссылку на ...» — отвечу только URL."
-      );
+    const mode = detectMode(text);
+
+    await addToHistory(userId, "user", text);
+    const history = await getHistory(userId);
+    const context = history
+      .map((m) => (m.role === "user" ? `Пользователь: ${m.text}` : `Ассистент: ${m.text}`))
+      .join("\n");
+
+    const persona =
+      "Ты — личный ассистент по имени Джарвис. " +
+      "НЕ говори, что ты бот/ИИ/модель, если тебя не спрашивают. " +
+      "Отвечай точно под запрос пользователя.";
+
+    let rules = "";
+    let maxTokens = 320;
+
+    if (mode === "LINK_ONLY") {
+      rules = "Ответь ТОЛЬКО одним URL. Без пояснений. Без списка. Без источников.";
+      maxTokens = 80;
+    } else if (mode === "DETAILED") {
+      rules = "Ответь развёрнуто: сначала кратко, потом объяснение и шаги.";
+      maxTokens = 700;
+    } else {
+      rules = "Отвечай кратко и по делу (1–6 предложений). Если нужно — предложи «подробнее».";
+      maxTokens = 320;
+    }
+
+    const prompt = `${persona}\n${rules}\n\nКонтекст:\n${context}\n\nЗапрос:\n${text}`;
+
+    const { text: answer } = await openaiAnswer({ prompt, maxTokens });
+
+    if (mode === "LINK_ONLY") {
+      const url = extractFirstUrl(answer);
+      const out = url ?? "Не нашёл точную ссылку — уточни название.";
+      await addToHistory(userId, "assistant", out);
+      await sendMessage(BOT_TOKEN, chatId, escapeHtml(out));
       return res.status(200).json({ ok: true });
     }
 
-    if (parsed.intent === "list_notes") {
-      const notes = await listNotes(userId, 5);
-      if (!notes.length) await sendMessage(BOT_TOKEN, chatId, "Пока нет заметок.");
-      else {
-        const lines = notes.map((n, i) => `${i + 1}) ${escapeHtml(n.text)}`);
-        await sendMessage(BOT_TOKEN, chatId, `<b>Заметки:</b>\n` + lines.join("\n"));
-      }
-      return res.status(200).json({ ok: true });
-    }
+    await addToHistory(userId, "assistant", answer);
+    await sendMessage(BOT_TOKEN, chatId, answer);
 
-    if (parsed.intent === "create_note") {
-      await setPending(userId, { intent: "create_note", fields: parsed.fields, mode: "draft" });
-      await sendMessage(
-        BOT_TOKEN,
-        chatId,
-        `Сохранить заметку?\n\n<b>${escapeHtml(parsed.fields.text)}</b>`,
-        buildConfirmKeyboard()
-      );
-      return res.status(200).json({ ok: true });
-    }
-
-    // ===== GPT CHAT =====
-    if (parsed.intent === "chat") {
-      const mode = detectMode(parsed.fields.text);
-
-      await addToHistory(userId, "user", parsed.fields.text);
-      const history = await getHistory(userId);
-
-      const context = history
-        .slice(-8)
-        .map((m) => (m.role === "user" ? `Пользователь: ${m.text}` : `Ассистент: ${m.text}`))
-        .join("\n");
-
-      const persona =
-        "Ты — личный ассистент по имени Джарвис. " +
-        "НЕ говори, что ты бот или ИИ, если тебя не спросили. " +
-        "Отвечай точно по запросу.";
-
-      let rules = "";
-      let maxTokens = 300;
-
-      if (mode === "LINK_ONLY") {
-        rules = "Ответь ТОЛЬКО одной ссылкой (URL). Без пояснений.";
-        maxTokens = 80;
-      } else if (mode === "DETAILED") {
-        rules = "Ответь развёрнуто: сначала кратко, потом объяснение.";
-        maxTokens = 700;
-      } else {
-        rules = "Отвечай кратко и по делу (1–6 предложений).";
-        maxTokens = 320;
-      }
-
-      const prompt =
-        `${persona}\n${rules}\n\n` +
-        `Контекст:\n${context}\n\n` +
-        `Запрос:\n${parsed.fields.text}`;
-
-      const { text: answer } = await openaiAnswer({
-        prompt,
-        maxTokens,
-      });
-
-      if (mode === "LINK_ONLY") {
-        const url = extractFirstUrl(answer);
-        const out = url ?? "Не нашёл точную ссылку — уточни название.";
-        await addToHistory(userId, "assistant", out);
-        await sendMessage(BOT_TOKEN, chatId, escapeHtml(out));
-        return res.status(200).json({ ok: true });
-      }
-
-      await addToHistory(userId, "assistant", answer);
-      await sendMessage(BOT_TOKEN, chatId, answer);
-      return res.status(200).json({ ok: true });
-    }
-
-    await sendMessage(BOT_TOKEN, chatId, "Не понял. Попробуй иначе 🙂");
     return res.status(200).json({ ok: true });
   } catch (e) {
     console.error(e);
+    // Telegram не любит 500
     return res.status(200).json({ ok: true });
   }
 }
